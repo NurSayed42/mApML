@@ -1,0 +1,171 @@
+version: "3.9"
+
+services:
+  redis:
+    image: redis:7-alpine
+    container_name: local_redis
+    ports:
+      - "6379:6379"
+    restart: unless-stopped
+    networks:
+      - multi-agent-platform
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 5
+
+  chroma:
+    image: chromadb/chroma:0.6.3
+    container_name: local_chroma
+    ports:
+      - "8001:8000"
+    environment:
+      - IS_PERSISTENT=TRUE
+    volumes:
+      - chroma_data:/chroma/chroma
+    restart: unless-stopped
+    networks:
+      - multi-agent-platform
+
+  api:
+    build:
+      context: ./backend
+      dockerfile: Dockerfile
+    container_name: multi-agent-api
+    ports:
+      - "8000:8000"
+    env_file:
+      - ./backend/.env
+    volumes:
+      - ./backend:/app
+    command: uvicorn main:app --host 0.0.0.0 --port 8000 --reload
+    depends_on:
+      redis:
+        condition: service_healthy
+      chroma:
+        condition: service_started
+    restart: unless-stopped
+    networks:
+      - multi-agent-platform
+
+  planner-worker:
+    build:
+      context: ./backend
+      dockerfile: Dockerfile
+    container_name: planner-worker
+    env_file:
+      - ./backend/.env
+    volumes:
+      - ./backend:/app
+    command: python -m workers.planner_worker
+    depends_on:
+      redis:
+        condition: service_healthy
+      chroma:
+        condition: service_started
+    restart: unless-stopped
+    networks:
+      - multi-agent-platform
+
+  research-worker:
+    build:
+      context: ./backend
+      dockerfile: Dockerfile
+    container_name: research-worker
+    env_file:
+      - ./backend/.env
+    volumes:
+      - ./backend:/app
+    command: python -m workers.research_worker
+    depends_on:
+      redis:
+        condition: service_healthy
+      chroma:
+        condition: service_started
+    restart: unless-stopped
+    networks:
+      - multi-agent-platform
+
+  content-worker:
+    build:
+      context: ./backend
+      dockerfile: Dockerfile
+    container_name: content-worker
+    env_file:
+      - ./backend/.env
+    volumes:
+      - ./backend:/app
+    command: python -m workers.content_worker
+    depends_on:
+      redis:
+        condition: service_healthy
+      chroma:
+        condition: service_started
+    restart: unless-stopped
+    networks:
+      - multi-agent-platform
+
+  analytics-worker:
+    build:
+      context: ./backend
+      dockerfile: Dockerfile
+    container_name: analytics-worker
+    env_file:
+      - ./backend/.env
+    volumes:
+      - ./backend:/app
+    command: python -m workers.analytics_worker
+    depends_on:
+      redis:
+        condition: service_healthy
+      chroma:
+        condition: service_started
+    restart: unless-stopped
+    networks:
+      - multi-agent-platform
+
+  aggregator-worker:
+    build:
+      context: ./backend
+      dockerfile: Dockerfile
+    container_name: aggregator-worker
+    env_file:
+      - ./backend/.env
+    volumes:
+      - ./backend:/app
+    command: python -m workers.aggregator_worker
+    depends_on:
+      redis:
+        condition: service_healthy
+      chroma:
+        condition: service_started
+    restart: unless-stopped
+    networks:
+      - multi-agent-platform
+
+  email-worker:
+    build:
+      context: ./backend
+      dockerfile: Dockerfile
+    container_name: email-worker
+    env_file:
+      - ./backend/.env
+    volumes:
+      - ./backend:/app
+    command: python -m workers.email_worker
+    depends_on:
+      redis:
+        condition: service_healthy
+      chroma:
+        condition: service_started
+    restart: unless-stopped
+    networks:
+      - multi-agent-platform
+
+networks:
+  multi-agent-platform:
+    name: multi-agent-platform
+
+volumes:
+  chroma_data:
