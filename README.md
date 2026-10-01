@@ -1,237 +1,118 @@
-# Multi-Agent AI Business Automation Platform
+# Multi-Agent Automation Platform
 
-An AI automation platform where six specialized agents collaborate to complete complex business tasks from a single instruction.
-
-![Python 3.11](https://img.shields.io/badge/Python-3.11-blue?style=flat-square&logo=python)
-![FastAPI](https://img.shields.io/badge/FastAPI-0.111-green?style=flat-square&logo=fastapi)
-![React](https://img.shields.io/badge/React-18-61dafb?style=flat-square&logo=react)
-![License: MIT](https://img.shields.io/badge/License-MIT-yellow?style=flat-square)
-![Deployed on Vercel](https://img.shields.io/badge/Frontend-Vercel-black?style=flat-square&logo=vercel)
-![Workers on Railway](https://img.shields.io/badge/Workers-Railway-purple?style=flat-square)
+A platform where specialized AI agents plan and execute multi-step business tasks from a single natural-language instruction. A planner turns the instruction into a dependency graph (DAG); independent workers handle research, content, email and analytics; an aggregator assembles the final result and streams progress to the browser.
 
 ---
 
-## Why This is Different
+## Overview
 
-| Feature | Zapier | ChatGPT | **This Platform** |
-|---|---|---|---|
-| Workflow type | Static templates | Sequential, single model | Dynamic DAG, multi-agent parallel |
-| AI reasoning | None | Basic | Specialized per agent |
-| Parallel execution | No | No | Yes — independent workers |
-| Memory | No | Session only | Short-term + long-term semantic |
-| Failure recovery | Manual | None | Automatic retry, fallback, DLQ |
-| Output | Single action | Text | Unified report — research + content + email + analytics |
+Submitting a task such as *"research competitors in X and draft an outreach email"* triggers the following flow:
 
----
+1. The API stores the task and an outbox record in a single PostgreSQL transaction.
+2. An outbox poller publishes the task to a Redis queue.
+3. The **Planner** worker asks the LLM to break the instruction into a DAG of sub-tasks.
+4. Specialized workers pick up the nodes whose dependencies are satisfied.
+5. The **Aggregator** resolves the DAG and builds the final output.
+6. Progress is pushed to the frontend over Server-Sent Events.
 
-## Live Demo
-
-> **URL:** https://autoagent-platform.vercel.app
-> **Demo email:** `demo@autoagent.ai`
-> **Demo password:** `Demo1234`
-
----
+Uploaded documents (PDF, DOCX, TXT) are chunked and embedded into ChromaDB, and can be queried through a RAG endpoint.
 
 ## Architecture
 
 ```
-User Browser (Vercel)
+React frontend (Vite)
         │  HTTPS REST + SSE
         ▼
-FastAPI API Server (Render)
+FastAPI API server
         │
-        ├── Outbox Poller (writes to PostgreSQL, publishes to Redis)
+        ├── Outbox poller (PostgreSQL → Redis)
+        ▼
+Redis task queue
         │
-Redis Task Queue (Railway)
-        │
-        ├──► Planner Worker    ──► Creates DAG
-        ├──► Research Worker   ──► Tavily / DuckDuckGo → ChromaDB
-        ├──► Content Worker    ──► Gemini → ChromaDB
-        ├──► Email Worker      ──► Gemini → Resend / EmailJS
-        ├──► Analytics Worker  ──► Scoring → Gemini recommendations
-        └──► Aggregator Worker ──► DAG resolution → Final output → SSE
+        ├──► Planner worker    ──► builds the task DAG
+        ├──► Research worker   ──► Tavily / DuckDuckGo → ChromaDB
+        ├──► Content worker    ──► LLM → ChromaDB
+        ├──► Email worker      ──► LLM → Resend / EmailJS
+        ├──► Analytics worker  ──► deterministic scoring + LLM recommendations
+        └──► Aggregator worker ──► DAG resolution → final output → SSE
 
-Data Layer:
-  PostgreSQL (Neon)  ──  All relational data, DAG state, outbox
-  Redis (Railway)    ──  Queue, locks, session memory, SSE events
-  ChromaDB (Railway) ──  Vector storage, RAG, long-term memory
+Data layer
+  PostgreSQL  – users, tasks, DAG state, outbox
+  Redis       – queue, locks, session memory, SSE events
+  ChromaDB    – vector storage for RAG and long-term memory
 ```
 
----
+A deeper walkthrough of the outbox flow and the DAG execution model is in [ARCHITECTURE.md](ARCHITECTURE.md).
 
-## Phase Plan
+### Workers
 
-| Phase | Status | Description |
+| Worker | Responsibility | Fallback behaviour |
 |---|---|---|
-| **Phase 1 — MVP** | ✅ Current | Single Railway project, shared codebase, free tiers, validates product-market fit |
-| **Phase 2 — Scale** | Planned at 285+ tasks/day | Railway paid workers, Gemini paid API, horizontal scaling, centralized logging, Slack triggers |
+| Planner | Creates the DAG and dispatches the first nodes | Marks the task as failed with a user-facing message |
+| Research | Web research, stores findings in ChromaDB | DuckDuckGo, then ChromaDB cache |
+| Content | Business content generation with validation | Retry with a refined prompt |
+| Email | Email drafting and delivery | EmailJS, then store as unsent |
+| Analytics | Deterministic scoring plus LLM recommendations | Default recommendation set |
+| Aggregator | Dependency resolution and output assembly | Per-section fallback content |
 
----
+### Design decisions
 
-## Workers
-
-| Worker | Single Responsibility | Primary Tool | Fallback |
-|---|---|---|---|
-| Planner | DAG creation and initial dispatch | Gemini 1.5 Flash | Mark task FAILED with user message |
-| Research | Information gathering and ChromaDB storage | Tavily API | DuckDuckGo → ChromaDB cache |
-| Content | Business content generation with validation | Gemini 1.5 Flash | Retry with refined prompt |
-| Email | Email generation and delivery | Resend API | EmailJS → store as UNSENT |
-| Analytics | Deterministic scoring + AI recommendations | Python scoring + Gemini | Default recommendation set |
-| Aggregator | Dependency resolution, output assembly | DAG state + ChromaDB | Gemini fallback content per failed section |
-
----
+- **Transactional outbox** – the task and its outbox record are written atomically, so a task is not lost if Redis is unavailable at submission time; the poller publishes it once Redis is back.
+- **Serializable DAG updates** – dependency resolution runs in a `SERIALIZABLE` transaction so two nodes finishing at the same time cannot both trigger (or both miss) a dependent node.
+- **`BRPOPLPUSH` queues** – a message stays in a backup list while it is being processed, so work from a crashed worker can be recovered on restart.
+- **Idempotent vector writes** – ChromaDB writes use deterministic document IDs, so retries do not create duplicates.
+- **Dead-letter queue** – repeatedly failing jobs are moved to a DLQ that admins can inspect and re-queue.
+- **SSE instead of WebSockets** – progress updates are one-directional, and SSE works over plain HTTP with the browser's native `EventSource`.
+- **Local embeddings** – `sentence-transformers` (`all-MiniLM-L6-v2`) runs on CPU, avoiding per-call embedding costs.
+- **Input safety** – prompt-injection filtering, `bleach` sanitization and `slowapi` rate limiting on the API.
 
 ## Tech Stack
 
-### Frontend
-| Technology | Purpose |
+| Area | Technology |
 |---|---|
-| React 18 | UI framework |
-| Vite | Build tool |
-| TailwindCSS | Styling |
-| Framer Motion | Animations |
-| EventSource API | SSE real-time updates |
+| Frontend | React 18, Vite, Tailwind CSS, Framer Motion, EventSource (SSE) |
+| API | FastAPI, Pydantic, slowapi, structlog |
+| Workers | Python 3.11, asyncio, APScheduler |
+| Data | PostgreSQL (asyncpg, SQLAlchemy, Alembic), Redis, ChromaDB |
+| AI / LLM | Google Gemini via a multi-provider LLM client, LangChain (chunking / RAG), sentence-transformers |
+| Integrations | Tavily, DuckDuckGo, Resend, EmailJS |
+| Tooling | Docker Compose, GitHub Actions, pytest, Locust |
 
-### Backend & Workers
-| Technology | Purpose |
-|---|---|
-| FastAPI | REST API + SSE streaming |
-| Python 3.11 | All workers |
-| asyncpg | Async PostgreSQL |
-| redis-py async | Queue, locks, session memory |
-| APScheduler | Scheduled tasks |
-| slowapi | Rate limiting |
-| structlog | Structured JSON logging |
-| bleach | Input sanitization |
+## Project Structure
 
-### AI & ML
-| Technology | Purpose |
-|---|---|
-| Gemini 1.5 Flash | Primary LLM — 15 RPM, 1M tokens/day free |
-| sentence-transformers all-MiniLM-L6-v2 | Embeddings — 90MB, CPU, no cost |
-| LangChain | Document chunking and RAG pipeline |
-| Tavily | Web search — 1,000/month free |
-| DuckDuckGo | Search fallback — free |
+```
+backend/
+├── api/v1/          # REST + SSE endpoints
+├── core/            # DAG, outbox, locks, memory, RAG, LLM client, retention
+├── workers/         # planner, research, content, email, analytics, aggregator
+├── models/          # database models
+├── prompts/         # prompt templates
+└── tests/           # unit, integration, chaos and load tests
+frontend/            # React + Vite client
+.github/workflows/   # CI pipeline
+ARCHITECTURE.md      # architecture deep dive
+```
 
-### Databases
-| Technology | Purpose | Free Tier |
-|---|---|---|
-| PostgreSQL (Neon) | Source of truth — tasks, DAG, users | 512MB |
-| Redis (Railway) | Queue, locks, session memory, SSE | 512MB |
-| ChromaDB (Railway) | Vector storage for RAG + memory | 512MB RAM |
-
----
-
-## Quick Start
+## Getting Started
 
 ```bash
-# 1. Clone the repository
-git clone https://github.com/yourname/multi-agent-platform.git
-cd multi-agent-platform
+git clone https://github.com/NurSayed42/mApML.git
+cd mApML
 
-# 2. Set up backend environment
-cd backend
-cp .env.example .env
-# Fill in environment variables (see table below)
-
-# 3. Start API server locally (databases connect to cloud)
+# Backend
+cp backend/.env.example backend/.env   # fill in the variables below
 docker-compose up
 
-# 4. Set up frontend
-cd ../frontend
+# Frontend
+cd frontend
 npm install
-cp .env.example .env.local
-# Set VITE_API_URL=http://localhost:8000
-
-# 5. Start frontend
+echo "VITE_API_URL=http://localhost:8000" > .env.local
 npm run dev
-
-# 6. Open http://localhost:3000
 ```
 
----
-
-## Environment Variables
-
-| Variable | Description | Where to Obtain | Required |
-|---|---|---|---|
-| `GEMINI_API_KEY` | Google Gemini API key | [Google AI Studio](https://aistudio.google.com/) | ✅ |
-| `TAVILY_API_KEY` | Tavily web search API | [Tavily](https://tavily.com/) | Optional |
-| `RESEND_API_KEY` | Email delivery API | [Resend](https://resend.com/) | Optional |
-| `DATABASE_URL` | PostgreSQL connection (asyncpg) | [Neon](https://neon.tech/) | ✅ |
-| `REDIS_URL` | Redis connection URL | [Railway](https://railway.app/) | ✅ |
-| `CHROMA_URL` | ChromaDB HTTP server URL | Railway Docker service | ✅ |
-| `JWT_SECRET_KEY` | JWT signing secret | `openssl rand -hex 32` | ✅ |
-| `ENVIRONMENT` | `development` or `production` | Set manually | ✅ |
-| `ALLOWED_ORIGIN` | CORS allowed origin | Your Vercel URL | ✅ |
-| `EMAILJS_SERVICE_ID` | EmailJS service ID | [EmailJS](https://emailjs.com/) | Optional |
-| `EMAILJS_TEMPLATE_ID` | EmailJS template ID | EmailJS dashboard | Optional |
-| `EMAILJS_PUBLIC_KEY` | EmailJS public key | EmailJS dashboard | Optional |
-
----
-
-## API Endpoints
-
-| Method | Route | Auth | Description |
-|---|---|---|---|
-| POST | `/api/v1/auth/register` | No | Register new user |
-| POST | `/api/v1/auth/login` | No | Login, get JWT tokens |
-| POST | `/api/v1/auth/refresh` | No | Refresh access token |
-| POST | `/api/v1/auth/logout` | Yes | Revoke refresh token |
-| GET | `/api/v1/auth/me` | Yes | Get current user |
-| POST | `/api/v1/tasks` | Yes | Submit automation task |
-| GET | `/api/v1/tasks` | Yes | List user's tasks |
-| GET | `/api/v1/tasks/{id}` | Yes | Get task details + output |
-| GET | `/api/v1/tasks/{id}/dag` | Yes | Get DAG execution graph |
-| GET | `/api/v1/tasks/scheduled` | Yes | List scheduled tasks |
-| POST | `/api/v1/tasks/scheduled` | Yes | Create scheduled task |
-| DELETE | `/api/v1/tasks/scheduled/{id}` | Yes | Cancel scheduled task |
-| GET | `/api/v1/stream/{task_id}?token=JWT` | JWT query | SSE real-time stream |
-| POST | `/api/v1/documents` | Yes | Upload PDF/DOCX/TXT |
-| GET | `/api/v1/documents` | Yes | List uploaded documents |
-| POST | `/api/v1/documents/query` | Yes | RAG question answering |
-| DELETE | `/api/v1/documents/{id}` | Yes | Delete document |
-| GET | `/api/v1/admin/stats` | Admin | Platform analytics |
-| GET | `/api/v1/admin/dlq` | Admin | Dead Letter Queue items |
-| POST | `/api/v1/admin/dlq/requeue` | Admin | Re-queue DLQ item |
-| GET | `/api/v1/admin/users` | Admin | List all users |
-| PATCH | `/api/v1/admin/users/{id}/role` | Admin | Change user role |
-| PATCH | `/api/v1/admin/users/{id}/status` | Admin | Activate/deactivate user |
-| POST | `/api/v1/admin/retention/trigger` | Admin | Run data retention now |
-| GET | `/api/v1/health` | No | Service health check |
-
----
-
-## Testing
+Workers run as separate processes:
 
 ```bash
-# Run all unit tests with coverage
-cd backend
-pytest tests/unit/ --cov=. --cov-report=term-missing -v
-
-# Run integration tests (requires live Redis + PostgreSQL)
-pytest tests/integration/ -v -m integration
-
-# Run load test (requires running server)
-locust -f tests/load/locustfile.py --host=http://localhost:8000 --users=10 --spawn-rate=2
-
-# Expected output (unit tests)
-# PASSED tests/unit/test_injection_filter.py::test_check_injection_safe_inputs
-# PASSED tests/unit/test_analytics_worker.py::test_compute_scores_high_quality
-# PASSED tests/unit/test_dag.py::test_create_dag_atomically_creates_nodes
-# ...
-# Coverage: 75%+
-```
-
----
-
-## Deployment
-
-### Railway Workers
-Each worker deploys as a separate Railway service in the same project.
-
-```bash
-# Start command per worker
 python -m workers.planner_worker
 python -m workers.research_worker
 python -m workers.content_worker
@@ -240,44 +121,57 @@ python -m workers.analytics_worker
 python -m workers.aggregator_worker
 ```
 
-### ChromaDB on Railway
-Deploy using the official Docker image: `chromadb/chroma`
-- Port: 8000
-- No additional configuration needed
+## Environment Variables
 
-### Render (API Server)
-- Connect GitHub repo
-- Build command: `pip install -r requirements.txt`
-- Start command: `gunicorn main:app -w 2 -k uvicorn.workers.UvicornWorker --bind 0.0.0.0:$PORT`
-- Set all environment variables in Render dashboard
+See [`backend/.env.example`](backend/.env.example).
 
-### Vercel (Frontend)
-- Connect `frontend/` directory
-- Framework: Vite
-- Set `VITE_API_URL` to your Render URL
+| Variable | Purpose | Required |
+|---|---|---|
+| `GEMINI_API_KEY` | Primary LLM provider | Yes |
+| `GROQ_API_KEY`, `MISTRAL_API_KEY` | Additional LLM providers | Optional |
+| `DATABASE_URL` | PostgreSQL connection string | Yes |
+| `REDIS_URL` | Redis connection string | Yes |
+| `CHROMA_URL` | ChromaDB HTTP server | Yes |
+| `JWT_SECRET_KEY` | JWT signing secret (`openssl rand -hex 32`) | Yes |
+| `ENVIRONMENT` | `development` or `production` | Yes |
+| `ALLOWED_ORIGIN` | CORS origin of the frontend | Yes |
+| `TAVILY_API_KEY` | Web search | Optional |
+| `RESEND_API_KEY` | Email delivery | Optional |
+| `EMAILJS_SERVICE_ID`, `EMAILJS_TEMPLATE_ID`, `EMAILJS_PUBLIC_KEY` | Email fallback | Optional |
 
----
+## API
 
-## Key Design Decisions
+| Method | Route | Description |
+|---|---|---|
+| POST | `/api/v1/auth/register`, `/login`, `/refresh`, `/logout` | Authentication (JWT access + refresh tokens) |
+| GET | `/api/v1/auth/me` | Current user |
+| POST / GET | `/api/v1/tasks` | Submit / list automation tasks |
+| GET | `/api/v1/tasks/{id}` | Task details and output |
+| GET | `/api/v1/tasks/{id}/dag` | DAG execution graph |
+| GET / POST / DELETE | `/api/v1/tasks/scheduled` | Scheduled tasks |
+| GET | `/api/v1/stream/{task_id}` | SSE progress stream |
+| POST / GET / DELETE | `/api/v1/documents` | Document upload and management |
+| POST | `/api/v1/documents/query` | RAG question answering over uploaded documents |
+| GET / POST / PATCH | `/api/v1/admin/...` | Stats, DLQ, user management, data retention |
+| GET | `/api/v1/health` | Health check |
 
-**Outbox Pattern** — Task submission writes task + outbox record in one atomic PostgreSQL transaction. If Redis is down at submission time, the outbox poller publishes when it recovers. Zero task loss.
+## Testing
 
-**Serializable Transaction for DAG** — Dependency resolution runs in a SERIALIZABLE PostgreSQL transaction to prevent race conditions when two leaf nodes complete simultaneously.
+```bash
+cd backend
+pytest tests/unit/ --cov=. -v                         # unit tests
+pytest tests/integration/ -v -m integration           # requires Redis + PostgreSQL
+locust -f tests/load/locustfile.py --host=http://localhost:8000
+```
 
-**BRPOPLPUSH** — Workers use BRPOPLPUSH instead of BRPOP. If a worker crashes mid-task, the message stays in the backup list and is drained on restart.
+The test suite covers the DAG, outbox, locks, idempotency, injection filter, retention and individual workers, plus a Redis-failure chaos test.
 
-**ChromaDB Upsert Idempotency** — Every ChromaDB write uses a deterministic document ID. Worker crash-and-retry produces identical write with no duplicates.
+## Future Improvements
 
-**SSE over WebSocket** — Unidirectional server-to-client perfectly matches this use case. Works over standard HTTP without special proxy config. Native browser EventSource needs no library.
+- Centralized logging and metrics across workers
+- Horizontal scaling of individual worker types
+- Additional task triggers (e.g. chat integrations)
 
-**Embedding model on CPU** — sentence-transformers all-MiniLM-L6-v2 runs on CPU with 150-200MB RAM, no API cost, no rate limits. Replaceable with an embedding API in Phase 2.
+## Author
 
----
-
-## License
-
-MIT © 2024 — see [LICENSE](LICENSE) for details.
-#   M A P  
- #   M A P  
- #   m A p M L  
- 
+**Nur Sayed** — Lead Engineer at VecoSoft · [GitHub](https://github.com/NurSayed42)
